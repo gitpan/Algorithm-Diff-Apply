@@ -1,10 +1,17 @@
 package Algorithm::Diff::Apply;
 use Carp;
 use strict;
+use constant DEFAULT_OPTIMISERS => (\&optimise_remove_duplicates);
+
 use base qw{Exporter};
 use vars qw{@EXPORT_OK $VERSION};
-@EXPORT_OK = qw{apply_diff apply_diffs mark_conflicts};
-$VERSION = '0.1.1';
+@EXPORT_OK = qw{
+	apply_diff
+	apply_diffs
+	mark_conflicts
+	optimise_remove_duplicates
+};
+$VERSION = '0.2.1';
 
 
 # Apply a single diff sequence. Nice and simple, and doesn't require
@@ -58,7 +65,8 @@ sub apply_diffs
 		ref($tag) and die("Tagnames must be scalar");
 		my $diff = shift;
 		ref($diff) eq 'ARRAY'
-			or croak("Diff sequences must be references of type \"ARRAY\"");
+			or croak("Diff sequences must be references of "
+				 . "type \"ARRAY\"");
 		$diff = [__homogenise_diff(@$diff)];
 		$diffset{$tag} = $diff;
 	}
@@ -69,11 +77,55 @@ sub apply_diffs
 		return wantarray ? @ary : \@ary;
 	}
 
-	# Apply hunks one by one, and generate a new array.
-	my $resolver = $opt{resolver} || \&mark_conflicts;
-	my $delta = 0;
-	while (my ($min, $max, %alts) = __shift_next_alternatives(\%diffset))
+	# First pass: detect conflicts and optimise them
+	my @optim;
+	if ($opt{optimisers} or $opt{optimizers})
 	{
+		push @optim, @{$opt{optimisers} || []};
+		push @optim, @{$opt{optimizers} || []};
+	}
+	else
+	{
+		@optim = &DEFAULT_OPTIMISERS;
+	}
+	my @alts;
+	while (my ($u_min, $u_max, %u_alt)
+	       = __shift_next_alternatives(\%diffset))
+	{
+		# Non-conflict case:
+		if (scalar(keys(%u_alt)) <= 1)
+		{
+			push(@alts, [$u_min, $u_max, %u_alt]);
+			next;
+		}
+
+		# Conflict case: pass each optimiser over it once.
+		foreach my $o (@optim)
+		{
+			%u_alt = $o->("conflict_block" => \%u_alt);
+			%u_alt = __diffset_discard_empties(%u_alt);
+		}
+		#__dump_diffset(%u_alt);
+		
+		# An optimiser could turn one block of conflicts into
+		# two or more, so re-detect any remaining conflicts
+		# within the block.
+
+		while (my ($o_min, $o_max, %o_alt)
+		       = __shift_next_alternatives(\%u_alt))
+		{
+			push(@alts, [$o_min, $o_max, %o_alt]);
+		}
+	}
+	
+	# Second pass: optimise them, then apply hunks one by one to
+	# generate the new array.
+	my $resolver = $opt{resolver} || \&mark_conflicts;
+
+	my $delta = 0;
+	while (my $alt = shift @alts)
+	{
+		my ($min, $max, %alts) = @$alt;
 		my @orig = @ary[$min + $delta .. $max + $delta - 1];
 		my @replacement;
 
@@ -110,6 +162,18 @@ sub apply_diffs
 }
 
 
+# Discard empty lists from a diffset.
+
+sub __diffset_discard_empties
+{
+	my %dset = @_;
+	return map {
+		($#{$dset{$_}} < 0) ? () : ($_ => $dset{$_});
+	} keys %dset;
+}
+
+
+
 
 # The default conflict resolution subroutine. Returns all alternative
 # texts with conflict markers inserted around them.
@@ -117,6 +181,7 @@ sub apply_diffs
 sub mark_conflicts
 {
 	my %opt = @_;
+	defined $opt{alt_txts} or confess("alt_txts not defined\n");
 	my %alt = %{$opt{alt_txts}};
 	my @ret;
 	foreach my $id (sort keys %alt)
@@ -128,6 +193,119 @@ sub mark_conflicts
 	return @ret;
 }
 
+
+sub optimise_remove_duplicates
+{
+	my %opt = @_;
+	my $block = $opt{conflict_block};
+	defined $block or confess("conflict_block not defined\n");
+	my @tags = reverse sort keys(%$block);
+	my %ret = map {$_ => []} @tags;
+    REFTAG:
+	while (my $tag = shift @tags)
+	{
+	    REFHUNK:
+		for my $hunk (@{$block->{$tag}})
+		{
+			for my $t (@tags)
+			{
+				for my $h (@{$block->{$t}})
+				{
+					__hunks_identical($hunk, $h)
+						and next REFHUNK;
+				}
+			}
+			push @{$ret{$tag}}, $hunk;
+		}
+	}
+	#$block = _semi_deep_copy($block);
+
+	return %ret;
+}
+
+
+sub __dump_diffset
+{
+	my %dset = @_;
+	print STDERR "-- begin diffset --\n";
+	for my $tag (sort keys %dset)
+	{
+		print STDERR "-- begin seq tag=\"$tag\" --\n";
+		my @diff = @{$dset{$tag}};
+		for my $diff (@diff)
+		{
+			print STDERR "\n\@".$diff->{start}."\n";
+			for my $e (@{$diff->{changes}})
+			{
+				my ($op, $data) = @$e;
+				$data = quotemeta($data);
+				$data =~ s{^(.{0,75})(.*)}{
+					$1 . ($2 eq "" ? "" : "...");
+				}se;
+				print STDERR "$op $data\n";
+			}
+		}
+		print STDERR "\n-- end seq tag=\"$tag\" --\n";
+	}	
+	print STDERR "-- end diffset --\n";
+}
+
+
+
+sub __hunks_identical
+{
+	my ($h1, $h2) = @_;
+	$h1->{start} == $h2->{start} or return 0;
+	$#{$h1->{changes}} == $#{$h2->{changes}} or return 0;
+	my $i;
+	for ($i=0; $i < $#{$h1->{changes}}; ++$i)
+	{
+		my ($op1, $data1) = @{ $h1->{changes}->[$i] };
+		my ($op2, $data2) = @{ $h2->{changes}->[$i] };
+		$op1 eq $op2 or return 0;
+		$data1 eq $data2 or return 0; # XXX FIXME XXX
+	}
+	return 1;
+}
+
+
+# Deep-copies a simple structure of simple Perl structures, copying
+# arrays, scalars, and hashes, and leaving filehandles, blessed refs
+# and anything else alone.
+
+sub _semi_deep_copy
+{
+	my $struct = shift;
+	my $type = ref($struct);
+	return $struct unless defined($type);
+	if ($type eq 'ARRAY')
+	{
+		my @ary;
+		foreach my $el (@$struct)
+		{
+			push(@ary, _semi_deep_copy($el));
+		}
+		return \@ary;
+	}
+	elsif ($type eq 'HASH')
+	{
+		my %hash;
+		while (my ($k, $v) = each %$struct)
+		{
+			$hash{$k} = _semi_deep_copy($v);
+		}
+		return \%hash;
+	}
+	elsif ($type eq 'SCALAR')
+	{
+		return _semi_deep_copy($$struct);
+	}
+	else
+	{
+		# leave it the hell alone
+		return $struct;
+	}
+}
 
 
 # *Terminology*
